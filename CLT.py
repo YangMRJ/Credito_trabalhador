@@ -7,21 +7,79 @@ import warnings
 import re
 import sys
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
 import os
 import shutil
 import glob
 import calendar
 
-# Configurações iniciais
+# --- AJUSTE PARA MODO THIN E PYINSTALLER ---
+# Importar explicitamente para garantir que o pacote de criptografia vá pro .exe
+try:
+    import cryptography
+    from cryptography.hazmat.primitives import hashes
+except ImportError:
+    pass
+
+# --- CONFIGURAÇÕES GERAIS ---
 init(autoreset=True)
 warnings.filterwarnings('ignore')
 
-# Configuração do Oracle Client
-oracledb.init_oracle_client(lib_dir=r"C:/ORACLE/instantclient_23_7")
+# LISTA DE EMPRESAS (Pastas que serão verificadas/criadas)
+LISTA_EMPRESAS = [1, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23]
+
+# --- DATA DINÂMICA (CORRIGIDO PARA MÊS ATUAL) ---
+def obter_competencia():
+    """
+    Calcula automaticamente a competência (1º dia do mês ATUAL).
+    Se hoje é 10/02/2026 -> Retorna '01/02/2026'
+    """
+    hoje = datetime.now()
+    mes = hoje.month # Pega o mês atual
+    ano = hoje.year
+    
+    data_formatada = f"01/{mes:02d}/{ano}"
+    return data_formatada
+
+DATA_PROCESSAMENTO = obter_competencia()
+
+# --- CONFIGURAÇÃO INTELIGENTE DO ORACLE CLIENT ---
+def configurar_oracle():
+    """
+    Tenta carregar o Oracle Client.
+    1. Se for .exe (frozen), busca na pasta 'oracle_client' ao lado.
+    2. Se for script, busca no caminho padrão de desenvolvimento.
+    Se não achar nada, deixa passar para o Modo Thin nativo.
+    """
+    try:
+        # Descobre onde o script ou o .exe está rodando
+        if getattr(sys, 'frozen', False):
+            # Se for executável (.exe)
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # Se for script Python (.py)
+            application_path = os.path.dirname(os.path.abspath(__file__))
+
+        # Caminho da pasta portátil
+        caminho_portatil = os.path.join(application_path, "oracle_client")
+
+        # Verifica se a pasta portátil existe
+        if os.path.exists(caminho_portatil):
+            oracledb.init_oracle_client(lib_dir=caminho_portatil)
+            print(f"{Fore.GREEN}Oracle Client Thick carregado com sucesso!{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.CYAN}Pasta oracle_client não encontrada. Usando modo Thin nativo.{Style.RESET_ALL}")
+            
+    except Exception as e:
+        # AGORA ELE VAI GRITAR O ERRO AO INVÉS DE ESCONDER
+        print(f"{Fore.RED}ERRO FATAL AO CARREGAR O ORACLE 19c: {e}{Style.RESET_ALL}")
+                    
+    except Exception as e:
+        # Se der erro aqui, vai estourar na conexão depois, então seguimos
+        pass
+
+configurar_oracle()
 
 # Credenciais do banco de dados
 DB_CONFIG = {
@@ -32,139 +90,104 @@ DB_CONFIG = {
     "service_name": "p01.pcrj"
 }
 
-# String de conexão para SQLAlchemy
-CONN_STRING = f"oracle+oracledb://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/?service_name={DB_CONFIG['service_name']}"
-
-# Nome do arquivo fixo
-ARQUIVO_EXCEL = "ARQUIVO-Consignações-CLT.xlsx"
-
-# Rubricas a serem excluídas do cálculo da margem líquida
 RUBRICAS_EXCLUIDAS = [
     1029, 652, 3791, 906, 923, 904, 953, 955, 3515, 3514, 3518, 3777, 3785, 961, 3786,
     3787, 3788, 3523, 3524, 3537, 3538, 3539, 3759, 3760, 3761, 3762, 3790, 905,
     1026, 3781, 3780, 3779, 3778, 3775, 3774, 3769, 3763, 3765, 3766, 3767, 3768
 ]
 
-def arquivar_relatorio_anterior():
-    """
-    Verifica se existe um relatório Excel anterior, cria uma pasta baseada no mês/ano
-    de modificação do arquivo e o move para lá.
-    """
-    try:
-        archive_base_path = r"C:\Users\03738044\Desktop\Projetos\ATC\CLT\Old"
-        report_files = glob.glob('RELATORIO_CONSIGNACOES_*.xlsx')
-        
-        if not report_files:
-            print(f"{Fore.CYAN}Nenhum relatório Excel anterior encontrado para arquivar.{Style.RESET_ALL}")
-            return
-            
-        latest_report = max(report_files, key=os.path.getmtime)
-        mod_time = os.path.getmtime(latest_report)
-        mod_date = datetime.fromtimestamp(mod_time)
-        destination_folder_name = mod_date.strftime("%m.%y")
-        destination_folder_path = os.path.join(archive_base_path, destination_folder_name)
-        
-        os.makedirs(destination_folder_path, exist_ok=True)
-        shutil.move(latest_report, destination_folder_path)
-        
-        print(f"{Fore.GREEN}Relatório Excel anterior '{latest_report}' arquivado em: {destination_folder_path}{Style.RESET_ALL}")
-
-    except Exception as e:
-        print(f"{Fore.RED}ERRO ao arquivar relatório Excel anterior: {str(e)}{Style.RESET_ALL}")
-
-def arquivar_csvs_anteriores():
-    """
-    Encontra todos os CSVs de empresas (comum e zerado), cria uma subpasta para a empresa dentro
-    da pasta de arquivamento do mês e move os arquivos para lá.
-    """
-    try:
-        archive_base_path = r"C:\Users\03738044\Desktop\Projetos\ATC\CLT\Old"
-        
-        # Procura por ambos os padrões de arquivos CSV
-        csv_files_comum = glob.glob('RELATORIO_EMPRESA_*.csv')
-        csv_files_zerado = glob.glob('RELATORIO_ZERADO_EMPRESA_*.csv')
-        # Procura também pelo novo arquivo de carga se existir
-        txt_files_carga = glob.glob('carga_movimentos_1029_*.txt')
-        
-        all_files = csv_files_comum + csv_files_zerado + txt_files_carga
-        
-        if not all_files:
-            print(f"{Fore.CYAN}Nenhum arquivo anterior encontrado para arquivar.{Style.RESET_ALL}")
-            return
-
-        total_moved = 0
-        for f_file in all_files:
-            try:
-                # Se for o arquivo TXT de carga, move para a raiz da pasta do mês
-                if 'carga_movimentos_1029' in f_file:
-                    mod_time = os.path.getmtime(f_file)
-                    mod_date = datetime.fromtimestamp(mod_time)
-                    month_year_folder_name = mod_date.strftime("%m.%y")
-                    destination_folder_path = os.path.join(archive_base_path, month_year_folder_name)
-                else:
-                    # Lógica para CSVs de empresa
-                    filename_parts = os.path.basename(f_file).split('_')
-                    # Tenta pegar o código da empresa (assumindo posição padrão)
-                    try:
-                        company_code = filename_parts[2]
-                        company_folder_name = f"emp_{company_code}"
-                    except:
-                        company_folder_name = "outros"
-
-                    mod_time = os.path.getmtime(f_file)
-                    mod_date = datetime.fromtimestamp(mod_time)
-                    month_year_folder_name = mod_date.strftime("%m.%y")
-                    
-                    # Cria o caminho de destino aninhado: Old -> MM.YY -> emp_XX
-                    destination_folder_path = os.path.join(archive_base_path, month_year_folder_name, company_folder_name)
-                
-                os.makedirs(destination_folder_path, exist_ok=True)
-                shutil.move(f_file, destination_folder_path)
-                total_moved += 1
-            except Exception as e:
-                print(f"{Fore.YELLOW}Aviso ao arquivar '{f_file}': {str(e)}{Style.RESET_ALL}")
-                continue
-        
-        if total_moved > 0:
-            print(f"{Fore.GREEN}Total de {total_moved} arquivos anteriores foram arquivados.{Style.RESET_ALL}")
-
-    except Exception as e:
-        print(f"{Fore.RED}ERRO ao arquivar arquivos anteriores: {str(e)}{Style.RESET_ALL}")
-
-
 def formatar_matricula(matricula, emp_codigo):
     """Formata a matrícula conforme as regras especificadas."""
+    try:
+        emp_codigo = int(emp_codigo)
+    except:
+        return str(matricula)
     
-    if emp_codigo == 1:
-        return str(matricula).strip()
-    elif emp_codigo == 10:
+    if (emp_codigo == 1 or emp_codigo == 10):
         return str(matricula).strip()
     
     mat_limpa = re.sub(r'[^0-9]', '', str(matricula))
     
-    if emp_codigo == 16 and not mat_limpa.startswith('1'):
+    if (emp_codigo == 13 or emp_codigo == 15 or emp_codigo == 16 or emp_codigo == 20) and not mat_limpa.startswith('1'):
         mat_limpa = '1' + mat_limpa
-    elif (emp_codigo == 18 or emp_codigo == 21) and not mat_limpa.startswith('2'):
+    elif (emp_codigo == 14 or emp_codigo == 18 or emp_codigo == 21) and not mat_limpa.startswith('2'):
         mat_limpa = '2' + mat_limpa
     elif emp_codigo == 17 and not mat_limpa.startswith('3'):
         mat_limpa = '3' + mat_limpa
-    elif emp_codigo == 14 and not mat_limpa.startswith('2'):
-        mat_limpa = '2' + mat_limpa
-    elif emp_codigo == 19 and not mat_limpa.startswith('4'):
+    elif (emp_codigo == 19 or emp_codigo == 23) and not mat_limpa.startswith('4'):
         mat_limpa = '4' + mat_limpa
-    elif emp_codigo == 20 and not mat_limpa.startswith('4'):
-        mat_limpa = '4' + mat_limpa        
-    elif emp_codigo == 15 and not mat_limpa.startswith('1'):
-        mat_limpa = '1' + mat_limpa
-    
+
     if len(mat_limpa) >= 8:
         return f"{mat_limpa[0]}.{mat_limpa[1:4]}.{mat_limpa[4:7]}-{mat_limpa[7]}"
     else:
         mat_limpa = mat_limpa.ljust(8, '0')
         return f"{mat_limpa[0]}.{mat_limpa[1:4]}.{mat_limpa[4:7]}-{mat_limpa[7]}"
+
+def corrigir_matriculas_por_cpf(df, emp_codigo):
+    """
+    Verifica se a matrícula existe no Oracle. Se não existir ou for inválida,
+    tenta encontrar a correta baseada no CPF.
+    """
+    print(f"  > Verificando/Corrigindo matrículas no banco de dados...")
     
-def consultar_dados_consignacao(df):
-    """Consulta os dados de consignação com margem líquida e busca NUMFUNC/NUMVINC."""
+    if 'cpf' in df.columns:
+        df['cpf_limpo'] = df['cpf'].astype(str).str.replace(r'[^0-9]', '', regex=True)
+        
+        try:
+            with oracledb.connect(
+                user=DB_CONFIG['user'],
+                password=DB_CONFIG['password'],
+                dsn=f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['service_name']}"
+            ) as conn:
+                with conn.cursor() as cursor:
+                    
+                    for idx, row in df.iterrows():
+                        matricula_original = str(row['matricula']).strip()
+                        cpf_atual = row['cpf_limpo']
+                        
+                        # 1. Simula como a matrícula ficaria formatada
+                        matricula_formatada = formatar_matricula(matricula_original, emp_codigo)
+                        
+                        # 2. Verifica se a matrícula formatada REALMENTE EXISTE na empresa
+                        query_check = """
+                            SELECT COUNT(*) 
+                            FROM ERGON.VINCULOS 
+                            WHERE MATRIC = :mat 
+                            AND EMP_CODIGO = :emp_codigo
+                        """
+                        cursor.execute(query_check, mat=matricula_formatada, emp_codigo=emp_codigo)
+                        existe_no_banco = cursor.fetchone()[0]
+                        
+                        # 3. Se a matrícula NÃO existe no banco, ou se veio vazia/zerada do arquivo, usamos o CPF
+                        if existe_no_banco == 0 or not matricula_original.isnumeric() or matricula_original == '0':
+                            
+                            query_cpf = """
+                                SELECT MATRIC FROM (
+                                    SELECT V.MATRIC 
+                                    FROM ERGON.FUNCIONARIOS F
+                                    JOIN ERGON.VINCULOS V ON V.NUMFUNC = F.NUMERO
+                                    WHERE F.CPF = :cpf
+                                    AND V.EMP_CODIGO = :emp_codigo
+                                    ORDER BY V.DTVAC NULLS FIRST
+                                ) WHERE ROWNUM = 1
+                            """
+                            cursor.execute(query_cpf, cpf=cpf_atual, emp_codigo=emp_codigo)
+                            resultado = cursor.fetchone()
+                            
+                            if resultado:
+                                matricula_corrigida = resultado[0]
+                                df.at[idx, 'matricula'] = matricula_corrigida
+                                print(f"{Fore.YELLOW}      - CPF {cpf_atual}: Matrícula alterada de '{matricula_original}' (Inexistente) para '{matricula_corrigida}'{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.RED}      - CPF {cpf_atual}: Matrícula não existe e CPF não foi localizado.{Style.RESET_ALL}")
+                                
+        except Exception as e:
+             print(f"{Fore.RED}    Erro ao tentar corrigir matrículas por CPF: {e}{Style.RESET_ALL}")
+             
+    return df
+
+def consultar_dados_consignacao(df, data_ref):
+    """Consulta os dados de consignação no Oracle."""
     df['MATRICULA_PADRONIZADA'] = df.apply(
         lambda x: formatar_matricula(x['matricula'], x['emp_Codigo']), 
         axis=1
@@ -173,7 +196,6 @@ def consultar_dados_consignacao(df):
     matriculas_consulta = df['MATRICULA_PADRONIZADA'].unique().tolist()
     
     if not matriculas_consulta:
-        print(f"{Fore.YELLOW}Aviso: Nenhuma matrícula válida para consulta{Style.RESET_ALL}")
         return {}
     
     resultados = {}
@@ -188,45 +210,13 @@ def consultar_dados_consignacao(df):
                 cursor.execute("ALTER SESSION SET nls_date_format='DD/MM/YYYY'")
 
                 total_matriculas = len(matriculas_consulta)
-                print(f"{Fore.CYAN}Iniciando consulta para {total_matriculas} matrículas...{Style.RESET_ALL}")
+                print(f"   -> Consultando {total_matriculas} matrículas no Oracle...")
                 
-                with tqdm(total=total_matriculas, desc="Consultando dados", unit="mat") as pbar:
-                    for matricula in matriculas_consulta:
-                        try:
-                            # Verifica status do vínculo
-                            query_status = """
-                            SELECT 
-                                CASE 
-                                    WHEN V.DTVAC IS NOT NULL THEN 'DESLIGADO'
-                                    WHEN V.DTAPOSENT IS NOT NULL THEN 'APOSENTADO'
-                                    ELSE 'ATIVO'
-                                END AS STATUS_VINCULO
-                            FROM ERGON.VINCULOS V
-                            WHERE V.MATRIC = :matricula
-                            AND ROWNUM = 1
-                            """
-                            cursor.execute(query_status, matricula=matricula)
-                            status_row = cursor.fetchone()
-                            status = status_row[0] if status_row else 'ATIVO'
-
-                            if status == 'DESLIGADO':
-                                resultados[matricula] = {
-                                    'STATUS': 'DESLIGADO',
-                                    'BASE_1023': 0,
-                                    'MARGEM_BRUTA': 0,
-                                    'MARGEM_LIQUIDA': 0,
-                                    'VALOR_999': 0,
-                                    'PLANO_SAUDE': 0
-                                }
-                                pbar.update(1)
-                                continue
-
-                            # Consulta Modificada para incluir NUMFUNC e NUMVINC
-                            query = f"""
+                query = f"""
                             SELECT 
                                 V.MATRIC,
-                                V.NUMFUNC,        -- ADICIONADO
-                                V.NUMERO AS NUMVINC, -- ADICIONADO 
+                                V.NUMFUNC,
+                                V.NUMERO AS NUMVINC,
                                 CASE 
                                     WHEN V.DTAPOSENT IS NOT NULL THEN 'APOSENTADO'
                                     ELSE 'ATIVO'
@@ -256,7 +246,7 @@ def consultar_dados_consignacao(df):
                                     JOIN ERGON.VINCULOS V2 ON V2.NUMFUNC = C.NUMFUNC AND V2.NUMERO = C.NUMVINC
                                     WHERE V2.MATRIC = V.MATRIC
                                     AND R2.TIPORUBR = 'CONSIGNATARIAS'
-                                    AND C.DTINI = '01/01/2026'
+                                    AND C.DTINI = :data_ref
                                     AND C.RUBRICA NOT IN ({','.join(map(str, RUBRICAS_EXCLUIDAS))})
                                 ) AS MARGEM_LIQUIDA,
                                 
@@ -267,7 +257,7 @@ def consultar_dados_consignacao(df):
                                     JOIN ERGON.VINCULOS V4 ON V4.NUMFUNC = FFF4.NUMFUNC AND V4.NUMERO = FFF4.NUMVINC
                                     WHERE V4.MATRIC = V.MATRIC
                                     AND FFF4.RUBRICA = 999
-                                    AND FFF4.MES_ANO_FOLHA = '01/01/2026'
+                                    AND FFF4.MES_ANO_FOLHA = :data_ref
                                 ), 0) as VALOR_999,
                                 
                                 -- Plano de saúde
@@ -278,7 +268,7 @@ def consultar_dados_consignacao(df):
                                     JOIN ERGON.RUBRICAS R5 ON R5.RUBRICA = FFF5.RUBRICA
                                     WHERE V5.MATRIC = V.MATRIC
                                     AND (R5.FLEX_CAMPO_10 = 'S' OR R5.RUBRICA = 3564)
-                                    AND FFF5.MES_ANO_FOLHA = '01/01/2026'
+                                    AND FFF5.MES_ANO_FOLHA = :data_ref
                                 ), 0) as PLANO_SAUDE
                             FROM ERGON.FATORES_RUBRICA_GERAL FTR
                             JOIN ERGON.FICHAS_FINANCEIRAS FFF ON FTR.RUBRICA = FFF.RUBRICA
@@ -287,45 +277,47 @@ def consultar_dados_consignacao(df):
                             JOIN ERGON.FOLHAS_EMP fe ON FFF.NUM_FOLHA = fe.NUMERO AND FFF.emp_codigo = fe.EMP_CODIGO AND fe.MES_ANO = FFF.MES_ANO_FOLHA
                             WHERE FTR.FATOR IN ('CRED MARGEM CONS')
                             AND FTR.DTFIM IS NULL
-                            AND FFF.MES_ANO_FOLHA = '01/01/2026'
+                            AND FFF.MES_ANO_FOLHA = :data_ref
                             AND FFF.EMP_CODIGO IN (1, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23)
                             AND FFF.EMP_CODIGO < 80
                             AND fe.TIPO_FOLHA = 'NORMAL'
                             AND v.matric = :matricula
-                            GROUP BY V.MATRIC, V.DTAPOSENT, V.NUMFUNC, V.NUMERO -- AGRUPAMENTO AJUSTADO
+                            GROUP BY V.MATRIC, V.DTAPOSENT, V.NUMFUNC, V.NUMERO
                             """
-                            cursor.execute(query, matricula=matricula)
-                            row = cursor.fetchone()
-                            
-                            pbar.update(1)
 
-                            if row:
-                                # Ajuste dos índices baseado no novo SELECT
-                                resultados[matricula] = {
-                                    'NUMFUNC': row[1],
-                                    'NUMVINC': row[2],
-                                    'STATUS': row[3],
-                                    'BASE_1023': row[4] if row[4] else 0,
-                                    'MARGEM_BRUTA': row[5] if row[5] else 0,
-                                    'MARGEM_LIQUIDA': row[6] if row[6] else 0,
-                                    'VALOR_999': row[7] if row[7] else 0,
-                                    'PLANO_SAUDE': row[8] if row[8] else 0
-                                }
+                for matricula in matriculas_consulta:
+                    try:
+                        cursor.execute("SELECT CASE WHEN DTVAC IS NOT NULL THEN 'DESLIGADO' ELSE 'ATIVO' END FROM ERGON.VINCULOS WHERE MATRIC = :m AND ROWNUM=1", m=matricula)
+                        status_chk = cursor.fetchone()
+                        
+                        if status_chk and status_chk[0] == 'DESLIGADO':
+                             resultados[matricula] = {'STATUS': 'DESLIGADO', 'BASE_1023': 0, 'MARGEM_LIQUIDA': 0}
+                             continue
 
-                        except oracledb.DatabaseError as e:
-                            error, = e.args
-                            print(f"\n{Fore.RED}Erro na matrícula {matricula}: {error.message}{Style.RESET_ALL}")
-                            continue
+                        cursor.execute(query, matricula=matricula, data_ref=data_ref)
+                        row = cursor.fetchone()
+                        
+                        if row:
+                            resultados[matricula] = {
+                                'NUMFUNC': row[1], 'NUMVINC': row[2], 'STATUS': row[3],
+                                'BASE_1023': row[4] or 0, 'MARGEM_BRUTA': row[5] or 0,
+                                'MARGEM_LIQUIDA': row[6] or 0, 'VALOR_999': row[7] or 0,
+                                'PLANO_SAUDE': row[8] or 0
+                            }
+                        else:
+                             resultados[matricula] = {'STATUS': 'NAO_ENCONTRADO_FOLHA'} 
+
+                    except Exception as e:
+                        continue
 
     except Exception as e:
-        print(f"{Fore.RED}Erro na conexão: {str(e)}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Erro Conexão Oracle: {e}{Style.RESET_ALL}")
         return {}
-
-    print(f"\n{Fore.GREEN}Consulta finalizada. Valores encontrados: {len(resultados)}{Style.RESET_ALL}")
+    
     return resultados
 
 def calcular_status_desconto(df):
-    """Calcula o status de desconto e o valor descontado para cada contrato, respeitando a ordem cronológica."""
+    """Lógica de cálculo de margem e descontos."""
     df['dataInicioContrato'] = pd.to_datetime(df['dataInicioContrato'], format='%d/%m/%Y', errors='coerce')
     df = df.sort_values(by=['MATRICULA_PADRONIZADA', 'dataInicioContrato'], ascending=[True, True])
     
@@ -334,11 +326,17 @@ def calcular_status_desconto(df):
     
     for matricula in df['MATRICULA_PADRONIZADA'].unique():
         df_matricula = df[df['MATRICULA_PADRONIZADA'] == matricula].copy()
-        margem_liquida = df_matricula['MARGEM LÍQUIDA 35% (R$)'].iloc[0]
+        try:
+            margem_liquida = df_matricula['MARGEM LÍQUIDA 35% (R$)'].iloc[0]
+            if pd.isna(margem_liquida): margem_liquida = 0
+        except:
+            margem_liquida = 0
         
         margem_restante = margem_liquida if margem_liquida > 0 else 0
+        
         for idx in df_matricula.index:
             parcela = df.at[idx, 'PARCELA (R$)']
+            if pd.isna(parcela): parcela = 0
             
             if margem_restante <= 0:
                 df.at[idx, 'STATUS_DESCONTO'] = 'SEM DESCONTO'
@@ -351,288 +349,299 @@ def calcular_status_desconto(df):
                 df.at[idx, 'STATUS_DESCONTO'] = 'DESCONTO PARCIAL'
                 df.at[idx, 'VALOR_DESCONTADO'] = margem_restante
                 margem_restante = 0
-    
     return df
 
-def gerar_arquivo_carga_ergon(df_relatorio, timestamp):
+def arquivar_outputs_antigos(caminho_pasta, emp_codigo, pasta_antigos):
     """
-    Gera o arquivo TXT com layout de Carga de Movimentos para o Ergon (Rubrica 1029).
+    Procura por Relatórios Finais e Arquivos de Carga antigos na pasta e move para 'antigos'.
     """
-    print(f"\n{Fore.CYAN}Gerando arquivo de Carga Ergon (Movimentos)...{Style.RESET_ALL}")
+    print(f"  > Verificando arquivos de saída antigos (Relatórios/Cargas)...")
     
-    try:
-        # Filtra apenas quem tem desconto (valor > 0)
-        df_carga = df_relatorio[df_relatorio['valor descontado'] > 0].copy()
-        
-        if df_carga.empty:
-            print(f"{Fore.MAGENTA}Nenhum registro com valor descontado para gerar carga.{Style.RESET_ALL}")
-            return
-
-        linhas_carga = []
-        
-        # Data de referência usada na carga (Pode parametrizar se necessário)
-        # Assumindo a data do mês de processamento definido no script '01/01/2026'
-        # Se quiser usar a data do notebook (01/12/2025), altere aqui
-        data_movimento = '01/01/2026' 
-
-        for _, row in df_carga.iterrows():
+    padroes = [
+        f"RELATORIO_FINAL_EMP_{emp_codigo}_*.xlsx",
+        f"CARGA_ERGON_EMP_{emp_codigo}_*.txt"
+    ]
+    
+    movidos = 0
+    for padrao in padroes:
+        arquivos_velhos = glob.glob(os.path.join(caminho_pasta, padrao))
+        for arquivo in arquivos_velhos:
             try:
-                nf = int(row['NUMFUNC'])
-                nv = int(row['NUMVINC'])
-                e  = int(row['cod_empresa'])
-                c = row['complemento']
+                nome_arquivo = os.path.basename(arquivo)
+                destino = os.path.join(pasta_antigos, nome_arquivo)
                 
-                # Formata valor trocando ponto por vírgula (formato brasileiro)
-                val = float(row['valor descontado'])
-                v_str = f"{val:.2f}".replace('.', ',')
-                
-                # Monta a linha conforme especificação
-                # {nf};{nv};{data};1029;1;{c};S;{v_str};U3738044;CARGA;{e};
-                # Obs: Mantido o usuario U3738044 fixo conforme solicitado no snippet
-                linha = f"{nf};{nv};{data_movimento};1029;1;{c};S;{v_str};U3738044;CARGA;{e};"
-                linhas_carga.append(linha)
+                if os.path.exists(destino):
+                    os.remove(destino)
+                    
+                shutil.move(arquivo, destino)
+                movidos += 1
             except Exception as e:
-                print(f"Erro ao montar linha para matricula {row.get('matricula')}: {e}")
-                continue
+                print(f"{Fore.RED}    Erro ao arquivar antigo {os.path.basename(arquivo)}: {e}{Style.RESET_ALL}")
+    
+    if movidos > 0:
+        print(f"    -> {movidos} arquivos de saída antigos movidos para pasta 'antigos'.")
 
-        corpo_dados = "\n".join(linhas_carga)
-        
-        # Cabeçalho de configuração
-        # Data de geração no cabeçalho
-        data_hora_geracao = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        
-        configuracao_carga = [
-            f'@TABELA=[ERGON][MOVIMENTOS][6.6.4][{data_hora_geracao}]',
-            '@CHAVE=[NUMFUNC][NUMBER][NUMVINC][NUMBER][RUBRICA][NUMBER]',
-            '@TAG INICIO=',
-            '@TAG FIM=',
-            '@SEPARADOR=;',
-            '@FORMATO DATA=DD/MM/YYYY',
-            '@SQL=[select to_char(NUMFUNC),to_char(NUMVINC),to_char(MES_ANO_DIREITO),to_char(RUBRICA),to_char(CHAVE),COMPLEMENTO,TIPO_MOVIMENTO,to_char(VALOR),RESPONSAVEL,OBS,to_char(EMP_CODIGO) FROM MOVIMENTOS]',
-            '@COLUNAS=[NUMFUNC][NUMBER][NUMVINC][NUMBER][MES_ANO_DIREITO][DATE][RUBRICA][NUMBER][CHAVE][NUMBER][COMPLEMENTO][VARCHAR2][TIPO_MOVIMENTO][VARCHAR2][VALOR][NUMBER][RESPONSAVEL][VARCHAR2][OBS][VARCHAR2][EMP_CODIGO][NUMBER]'
-        ]
+def processar_uma_empresa(emp_codigo, caminho_pasta):
+    """Processa todos os arquivos Excel e CSV encontrados na pasta da empresa."""
+    
+    pasta_antigos = os.path.join(caminho_pasta, "antigos")
+    os.makedirs(pasta_antigos, exist_ok=True)
 
-        conteudo_final = "\n".join(configuracao_carga) + "\n" + corpo_dados
-        
-        nome_arquivo_txt = f"carga_movimentos_1029_{timestamp}.txt"
-        
-        with open(nome_arquivo_txt, 'w', encoding='latin-1') as file:
-            file.write(conteudo_final)
-            
-        print(f"{Fore.GREEN}Arquivo de carga gerado com sucesso: {nome_arquivo_txt}{Style.RESET_ALL}")
+    # --- PASSO 1: LIMPEZA DE ARQUIVOS GERADOS ANTIGOS ---
+    arquivar_outputs_antigos(caminho_pasta, emp_codigo, pasta_antigos)
 
-    except Exception as e:
-        print(f"{Fore.RED}Erro ao gerar arquivo de carga: {str(e)}{Style.RESET_ALL}")
+    # --- PASSO 2: ENCONTRAR NOVOS ARQUIVOS DE ENTRADA (XLSX e CSV) ---
+    # Procura XLSX e CSV
+    todos_arquivos = glob.glob(os.path.join(caminho_pasta, "*.xlsx")) + \
+                     glob.glob(os.path.join(caminho_pasta, "*.csv"))
+    
+    arquivos_validos = []
+    
+    # FILTRO DE SEGURANÇA: Remove arquivos que parecem ser Outputs (Relatórios ou Cargas)
+    for f in todos_arquivos:
+        nome = os.path.basename(f).upper()
+        # Se começar com RELATORIO ou CARGA, a gente ignora e avisa
+        if nome.startswith("RELATORIO_FINAL") or nome.startswith("CARGA_ERGON"):
+            # Opcional: print(f"    -> Ignorando arquivo de sistema: {nome}")
+            continue
+        arquivos_validos.append(f)
 
+    if not arquivos_validos:
+        print(f"{Fore.LIGHTBLACK_EX}Empresa {emp_codigo}: Nenhum arquivo de entrada (XLSX/CSV) novo.{Style.RESET_ALL}")
+        return
 
-def processar_arquivo():
-    try:
-        # Arquiva os relatórios (Excel, CSVs e TXTs) da execução anterior
-        arquivar_relatorio_anterior()
-        arquivar_csvs_anteriores()
+    print(f"{Fore.YELLOW}Empresa {emp_codigo}: Encontrados {len(arquivos_validos)} arquivos de entrada.{Style.RESET_ALL}")
 
-        # Ler arquivo Excel
-        print(f"\n{Fore.YELLOW}Processando arquivo: {ARQUIVO_EXCEL}{Style.RESET_ALL}")
-        df = pd.read_excel(ARQUIVO_EXCEL, sheet_name='Planilha1')
+    for arquivo in arquivos_validos:
+        nome_arq = os.path.basename(arquivo)
+        extensao = os.path.splitext(nome_arq)[1].lower()
+        print(f"  > Processando entrada: {nome_arq}")
         
-        # --- VALIDAÇÃO DE COLUNAS ---
-        colunas_necessarias = [
-            'contrato', 'cpf', 'matricula', 'emp_Codigo', 'valorParcela', 
-            'nomeTrabalhador', 'dataInicioContrato',
-            'inscricaoEmpregador.descricao', 'numeroInscricaoEmpregador' # <--- NOVAS COLUNAS
-        ]
-        for coluna in colunas_necessarias:
-            if coluna not in df.columns:
-                raise ValueError(f"{Fore.RED}Coluna obrigatória '{coluna}' não encontrada{Style.RESET_ALL}")
-        
-        # Consultar dados no Oracle
-        dados_por_matricula = consultar_dados_consignacao(df)
-        
-        if not dados_por_matricula:
-            raise ValueError(f"{Fore.RED}Não foi possível obter os dados do Oracle{Style.RESET_ALL}")
-        
-        # Adicionar dados ao DataFrame
-        df['MATRICULA_PADRONIZADA'] = df.apply(
-            lambda x: formatar_matricula(x['matricula'], x['emp_Codigo']), 
-            axis=1
-        )
-        
-        df['STATUS'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('STATUS', 'ATIVO'))
-        
-        # Mapeando novos campos NUMFUNC e NUMVINC
-        df['NUMFUNC'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('NUMFUNC', 0))
-        df['NUMVINC'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('NUMVINC', 0))
-
-        df['BASE_1023'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('BASE_1023', 0))
-        df['MARGEM_BRUTA'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('MARGEM_BRUTA', 0))
-        df['MARGEM_LIQUIDA_35'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('MARGEM_LIQUIDA', 0))
-        df['VALOR_999'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_por_matricula.get(x, {}).get('VALOR_999', 0))
-        
-        df = df[df['BASE_1023'].notna()]
-        
-        if df.empty:
-            raise ValueError(f"{Fore.RED}Nenhum registro com dados válidos{Style.RESET_ALL}")
-        
-        # Renomear colunas para padronização
-        df = df.rename(columns={
-            'valorParcela': 'PARCELA (R$)',
-            'MARGEM_LIQUIDA_35': 'MARGEM LÍQUIDA 35% (R$)'
-        })
-        
-        processing_date = datetime.strptime('01/01/2026', '%d/%m/%Y')
-        
-        # Calcular status de desconto
-        df = calcular_status_desconto(df)
-
-        df['COMPLEMENTO'] = 'EMPRESTIMO_' + (df.groupby('MATRICULA_PADRONIZADA').cumcount() + 1).astype(str).str.zfill(2)
-        
-        # --- SELEÇÃO DE COLUNAS PARA O RELATÓRIO FINAL ---
-        colunas_relatorio = [
-            'ifConcessora.codigo', 'ifConcessora.descricao',
-            'contrato', 'cpf', 'MATRICULA_PADRONIZADA', 'nomeTrabalhador', 'STATUS', 
-            'NUMFUNC', 'NUMVINC', 
-            'BASE_1023', 'PARCELA (R$)',
-            'MARGEM LÍQUIDA 35% (R$)', 'valorEmprestimo', 'emp_Codigo',
-            'STATUS_DESCONTO', 'VALOR_DESCONTADO', 'dataInicioContrato', 'COMPLEMENTO',
-            'inscricaoEmpregador.descricao', 'numeroInscricaoEmpregador' # <--- ADICIONADO AQUI
-        ]
-        
-        colunas_disponiveis = [col for col in colunas_relatorio if col in df.columns]
-        df_relatorio = df[colunas_disponiveis]
-        
-        # --- RENOMEAÇÃO DE COLUNAS ---
-        mapeamento_nomes = {
-            'ifConcessora.codigo': 'ifConcessora.codigo',
-            'ifConcessora.descricao': 'ifConcessora.descricao',
-            'contrato': 'contrato',
-            'cpf': 'cpf',
-            'MATRICULA_PADRONIZADA': 'matricula',
-            'nomeTrabalhador': 'nome',
-            'STATUS': 'status',
-            'BASE_1023': 'base 1023',
-            'PARCELA (R$)': 'parcela',
-            'MARGEM LÍQUIDA 35% (R$)': 'margem liquida',
-            'valorEmprestimo': 'emprestimo',
-            'emp_Codigo': 'cod_empresa',
-            'STATUS_DESCONTO': 'status desconto',
-            'VALOR_DESCONTADO': 'valor descontado',
-            'dataInicioContrato': 'data inicio',
-            'COMPLEMENTO': 'complemento',
-            'inscricaoEmpregador.descricao': 'descricao empregador',  # <--- RENOMEAÇÃO
-            'numeroInscricaoEmpregador': 'numero inscricao'          # <--- RENOMEAÇÃO
-        }
-        df_relatorio = df_relatorio.rename(columns=mapeamento_nomes)
-        
-        # Formatação de valores
-        colunas_numericas = ['base 1023', 'parcela', 'margem liquida', 'emprestimo', 'valor descontado']
-        
-        for coluna in colunas_numericas:
-            if coluna in df_relatorio.columns:
-                df_relatorio[coluna] = df_relatorio[coluna].apply(lambda x: round(float(x), 2) if pd.notnull(x) else x)
-        
-        # Ordenar resultados
-        df_relatorio = df_relatorio.sort_values(['matricula', 'data inicio'], ascending=[True, True])
-        
-        # Exibir estatísticas
-        print(f"\n{Fore.GREEN}RELATÓRIO COMPLETO DE CONSIGNAÇÕES{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Total de registros: {len(df_relatorio)}{Style.RESET_ALL}")
-        
-        # Exportar para Excel
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        nome_relatorio = f"RELATORIO_CONSIGNACOES_{timestamp}.xlsx"
-        df_relatorio.to_excel(nome_relatorio, sheet_name='REGISTROS', index=False)
-        
-        # Aplicar formatação condicional
-        wb = load_workbook(nome_relatorio)
-        ws = wb.active
-        
-        verde = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-        azul = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')
-        amarelo = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
-        vermelho = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-        
-        status_col_idx = df_relatorio.columns.get_loc('status') + 1
-        status_desconto_col_idx = df_relatorio.columns.get_loc('status desconto') + 1
-        
-        for row in range(2, ws.max_row + 1):
-            status = ws.cell(row=row, column=status_col_idx).value
-            status_desconto = ws.cell(row=row, column=status_desconto_col_idx).value
-            
-            fill_color = amarelo
-            if status in ['DESLIGADO', 'APOSENTADO']:
-                fill_color = vermelho
-            elif status_desconto == 'DESCONTO COMPLETO':
-                fill_color = verde
-            elif status_desconto == 'DESCONTO PARCIAL':
-                fill_color = azul
-            
-            for col in range(1, ws.max_column + 1):
-                ws.cell(row=row, column=col).fill = fill_color
-        
-        # Ajustar largura das colunas
-        for col in ws.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
+        try:
+            # --- LEITURA DO ARQUIVO (MODIFICADO PARA SUPORTAR CSV) ---
+            if extensao == '.xlsx':
+                df = pd.read_excel(arquivo)
+            elif extensao == '.csv':
+                # Tenta ler CSV padrão Brasil (Ponto e vírgula e decimal com vírgula)
                 try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
+                    df = pd.read_csv(arquivo, sep=';', encoding='latin-1', decimal=',')
                 except:
-                    pass
-            adjusted_width = (max_length + 2) * 1.2
-            ws.column_dimensions[column].width = adjusted_width
-        
-        wb.save(nome_relatorio)
-        print(f"\n{Fore.GREEN}Relatório principal salvo como: {nome_relatorio}{Style.RESET_ALL}")
+                    # Se falhar, tenta formato internacional (vírgula e utf-8)
+                    print(f"{Fore.CYAN}    Aviso: Tentando ler CSV com separador vírgula e UTF-8...{Style.RESET_ALL}")
+                    df = pd.read_csv(arquivo, sep=',', encoding='utf-8', decimal='.')
 
-        # --- Geração CSVs Layouts ---
-        print(f"\n{Fore.CYAN}Gerando layouts CSV por empresa...{Style.RESET_ALL}")
-        
-        codigos_empresa = df_relatorio['cod_empresa'].unique()
-        data_inicio_str = processing_date.strftime('01/%m/%Y')
-        _, num_dias = calendar.monthrange(processing_date.year, processing_date.month)
-        data_fim_str = f"{num_dias}/{processing_date.month:02d}/{processing_date.year}"
+            df['emp_Codigo'] = int(emp_codigo)
+            
+            # Remove espaços em branco dos nomes das colunas (sanity check)
+            df.columns = df.columns.str.strip()
 
-        for codigo in codigos_empresa:
-            df_empresa = df_relatorio[df_relatorio['cod_empresa'] == codigo]
-            df_filtrado = df_empresa[df_empresa['status desconto'].isin(['DESCONTO COMPLETO', 'DESCONTO PARCIAL'])].copy()
-
-            if df_filtrado.empty:
+            cols_req = ['contrato', 'cpf', 'matricula', 'valorParcela', 'nomeTrabalhador']
+            
+            # Verifica colunas
+            if not all(col in df.columns for col in cols_req):
+                colunas_faltantes = [col for col in cols_req if col not in df.columns]
+                print(f"{Fore.RED}    Erro: Colunas faltando em {nome_arq}: {colunas_faltantes}{Style.RESET_ALL}")
                 continue
 
-            # Layout Comum
-            df_layout_comum = pd.DataFrame()
-            df_layout_comum['matricula'] = df_filtrado['matricula']
-            df_layout_comum['data inicio'] = data_inicio_str
-            df_layout_comum['data fim'] = data_fim_str
-            df_layout_comum['rubrica'] = 1029
-            df_layout_comum['complemento'] = df_filtrado['complemento'].fillna('')
-            df_layout_comum['tipo'] = 'Livre'
-            df_layout_comum['valor descontado'] = df_filtrado['valor descontado']
-            df_layout_comum['empresa'] = df_filtrado['cod_empresa']
+            # --- CORREÇÃO HÍBRIDA (PONTO E VÍRGULA) ---
+            def converter_valor_hibrido(val):
+                """
+                Converte o valor de forma inteligente:
+                - Se tiver vírgula, assume formato BR (1.000,50) -> Remove ponto milhar, troca vírgula por ponto.
+                - Se NÃO tiver vírgula, assume que o ponto já é decimal (1000.50).
+                """
+                try:
+                    # Se já for número (float/int), retorna direto
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    
+                    val_str = str(val).strip()
+                    
+                    # Lógica: Se tem vírgula, assumimos formato Brasileiro
+                    if ',' in val_str:
+                        # Remove o ponto de milhar (1.000,00 -> 1000,00)
+                        val_str = val_str.replace('.', '')
+                        # Troca vírgula por ponto (1000,00 -> 1000.00)
+                        val_str = val_str.replace(',', '.')
+                    
+                    # Se não tem vírgula, mantemos o ponto original para o float() ler corretamente
+                    return float(val_str)
+                except:
+                    return 0.0
+
+            # Aplica a função de conversão
+            df['valorParcela'] = df['valorParcela'].apply(converter_valor_hibrido)
+            # ------------------------------------------
+
+            # --- NOVA ETAPA: CORREÇÃO POR CPF ---
+            df = corrigir_matriculas_por_cpf(df, emp_codigo)
+            # ------------------------------------
+
+            # Consultar Oracle
+            dados_oracle = consultar_dados_consignacao(df, DATA_PROCESSAMENTO)
             
-            nome_csv_comum = f"RELATORIO_EMPRESA_{codigo}_{timestamp}.csv"
-            df_layout_comum.to_csv(nome_csv_comum, index=False, sep=';', encoding='utf-8-sig', header=False, decimal=',')
+            if not dados_oracle:
+                print(f"{Fore.RED}    Erro: Falha na consulta Oracle ou sem matrículas válidas.{Style.RESET_ALL}")
+                continue
 
-            # Layout Zerado
-            df_layout_zerado = pd.DataFrame()
-            df_layout_zerado['matricula'] = df_filtrado['matricula']
-            df_layout_zerado['data inicio'] = data_inicio_str
-            df_layout_zerado['rubrica'] = 1029
-            df_layout_zerado['complemento'] = df_filtrado['complemento'].fillna('')
-            df_layout_zerado['tipo'] = 'A'
-            df_layout_zerado['valor'] = 0
-            df_layout_zerado['empresa'] = df_filtrado['cod_empresa']
+            # Mapeamento de dados
+            df['MATRICULA_PADRONIZADA'] = df.apply(lambda x: formatar_matricula(x['matricula'], emp_codigo), axis=1)
+            df['STATUS'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_oracle.get(x, {}).get('STATUS', 'NAO_ENC'))
+            df['NUMFUNC'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_oracle.get(x, {}).get('NUMFUNC', 0))
+            df['NUMVINC'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_oracle.get(x, {}).get('NUMVINC', 0))
+            df['BASE_1023'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_oracle.get(x, {}).get('BASE_1023', 0))
+            df['MARGEM LÍQUIDA 35% (R$)'] = df['MATRICULA_PADRONIZADA'].map(lambda x: dados_oracle.get(x, {}).get('MARGEM_LIQUIDA', 0))
+            
+            df = df.rename(columns={'valorParcela': 'PARCELA (R$)'})
+            
+            # Cálculo
+            df = calcular_status_desconto(df)
+            df['COMPLEMENTO'] = 'EMPRESTIMO_' + (df.groupby('MATRICULA_PADRONIZADA').cumcount() + 1).astype(str).str.zfill(2)
 
-            nome_csv_zerado = f"RELATORIO_ZERADO_EMPRESA_{codigo}_{timestamp}.csv"
-            df_layout_zerado.to_csv(nome_csv_zerado, index=False, sep=';', encoding='utf-8-sig', header=False, decimal=',')
+            # --- GERAÇÃO DOS RELATÓRIOS ---
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 1. Relatório Excel
+            nome_relatorio = os.path.join(caminho_pasta, f"RELATORIO_FINAL_EMP_{emp_codigo}_{timestamp}.xlsx")
+            
+            # --- DEFINIÇÃO DA ORDEM DAS COLUNAS ---
+            # Define as colunas fixas principais
+            colunas_fixas = [
+                'contrato', 'cpf', 'MATRICULA_PADRONIZADA', 'nomeTrabalhador', 'STATUS',
+                'BASE_1023', 'PARCELA (R$)', 'MARGEM LÍQUIDA 35% (R$)',
+                'STATUS_DESCONTO', 'VALOR_DESCONTADO', 'COMPLEMENTO'
+            ]
+            
+            # Lista inicial com as colunas prioritárias (se existirem)
+            colunas_finais = []
+            cols_prioridade = ['ifConcessora.codigo', 'ifConcessora.descricao']
+            
+            # Adiciona as prioritárias primeiro se elas existirem no DataFrame
+            for col in cols_prioridade:
+                if col in df.columns:
+                    colunas_finais.append(col)
+            
+            # Adiciona as demais fixas
+            colunas_finais.extend(colunas_fixas)
+            
+            # Adiciona outras colunas extras (como numeroInscricaoEmpregador) se existirem
+            extras = ['numeroInscricaoEmpregador']
+            for e in extras:
+                if e in df.columns: colunas_finais.append(e)
 
-        # --- NOVA FUNÇÃO CHAMADA AQUI ---
-        gerar_arquivo_carga_ergon(df_relatorio, timestamp)
+            # Filtra apenas as colunas que realmente existem no DF para evitar erro de KeyError
+            colunas_existentes = [c for c in colunas_finais if c in df.columns]
 
-    except Exception as e:
-        print(f"\n{Fore.RED}ERRO: {str(e)}{Style.RESET_ALL}")
-        return -1
+            df_export = df[colunas_existentes].copy()
+            df_export.to_excel(nome_relatorio, index=False)
+            
+            # --- FORMATAÇÃO DAS CORES ---
+            wb = load_workbook(nome_relatorio)
+            ws = wb.active
+            
+            verde = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')    # Desconto Completo
+            azul = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')     # Desconto Parcial
+            amarelo = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')  # Sem Desconto
+            vermelho = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid') # Desligado/Aposentado
+            
+            idx_status = None
+            idx_desc = None
+            
+            for cell in ws[1]:
+                if cell.value == 'STATUS': idx_status = cell.column
+                if cell.value == 'STATUS_DESCONTO': idx_desc = cell.column
+            
+            if idx_status and idx_desc:
+                for row in range(2, ws.max_row + 1):
+                    val_st = ws.cell(row, idx_status).value
+                    val_dc = ws.cell(row, idx_desc).value
+                    
+                    fill_color = None
+                    if val_st in ['DESLIGADO', 'APOSENTADO']:
+                        fill_color = vermelho
+                    elif val_dc == 'DESCONTO COMPLETO':
+                        fill_color = verde
+                    elif val_dc == 'DESCONTO PARCIAL':
+                        fill_color = azul
+                    elif val_dc == 'SEM DESCONTO':
+                        fill_color = amarelo
+                    
+                    if fill_color:
+                        for col in range(1, ws.max_column + 1):
+                            ws.cell(row, col).fill = fill_color
+            
+            # Ajuste de largura
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2) * 1.1
+                ws.column_dimensions[column].width = adjusted_width
+
+            wb.save(nome_relatorio)
+
+            # 2. Arquivo de Carga (TXT)
+            df_carga = df[df['VALOR_DESCONTADO'] > 0].copy()
+            if not df_carga.empty:
+                linhas = []
+                for _, r in df_carga.iterrows():
+                    val_str = f"{r['VALOR_DESCONTADO']:.2f}".replace('.', ',')
+                    linha = f"{int(r['NUMFUNC'])};{int(r['NUMVINC'])};{DATA_PROCESSAMENTO};1029;1;{r['COMPLEMENTO']};S;{val_str};U3738044;CARGA;{emp_codigo};"
+                    linhas.append(linha)
+                
+                header = [
+                    f'@TABELA=[ERGON][MOVIMENTOS][6.6.4][{datetime.now().strftime("%d/%m/%Y")}]',
+                    '@CHAVE=[NUMFUNC][NUMBER][NUMVINC][NUMBER][RUBRICA][NUMBER]',
+                    '@TAG INICIO=', '@TAG FIM=', '@SEPARADOR=;', '@FORMATO DATA=DD/MM/YYYY',
+                    '@COLUNAS=[NUMFUNC][NUMBER][NUMVINC][NUMBER][MES_ANO_DIREITO][DATE][RUBRICA][NUMBER][CHAVE][NUMBER][COMPLEMENTO][VARCHAR2][TIPO_MOVIMENTO][VARCHAR2][VALOR][NUMBER][RESPONSAVEL][VARCHAR2][OBS][VARCHAR2][EMP_CODIGO][NUMBER]'
+                ]
+                
+                txt_path = os.path.join(caminho_pasta, f"CARGA_ERGON_EMP_{emp_codigo}_{timestamp}.txt")
+                with open(txt_path, 'w', encoding='latin-1') as ftxt:
+                    ftxt.write("\n".join(header + linhas))
+
+            # 3. Arquivar o original
+            destino_original = os.path.join(pasta_antigos, nome_arq)
+            if os.path.exists(destino_original):
+                os.remove(destino_original)
+            
+            shutil.move(arquivo, destino_original)
+            print(f"{Fore.GREEN}    -> Sucesso! Arquivos gerados e movidos.{Style.RESET_ALL}")
+
+        except Exception as e:
+            print(f"{Fore.RED}    -> FALHA CRÍTICA no arquivo {nome_arq}: {e}{Style.RESET_ALL}")
+            # import traceback
+            # traceback.print_exc()
+
+def main():
+    root_dir = os.getcwd()
+    
+    # Se estiver rodando como .exe, mostra onde ele acha que está
+    if getattr(sys, 'frozen', False):
+         root_dir = os.path.dirname(sys.executable)
+         os.chdir(root_dir) # Garante que está na pasta do exe
+
+    print(f"{Fore.CYAN}=== INICIANDO PROCESSAMENTO AUTOMÁTICO ==={Style.RESET_ALL}")
+    print(f"Diretório Raiz: {root_dir}")
+    print(f"Data de Competência Calculada: {DATA_PROCESSAMENTO}")
+    print("-------------------------------------------------")
+
+    for codigo in LISTA_EMPRESAS:
+        dir_empresa = os.path.join(root_dir, str(codigo))
+        if not os.path.exists(dir_empresa):
+            os.makedirs(dir_empresa)
+            print(f"Pasta criada: {codigo} (Vazia)")
+            continue
+        processar_uma_empresa(codigo, dir_empresa)
+    
+    print("\n-------------------------------------------------")
+    print(f"{Fore.CYAN}=== FIM DO PROCESSAMENTO ==={Style.RESET_ALL}")
+    input("Pressione ENTER para fechar...") # Para a janela não sumir no fim
 
 if __name__ == "__main__":
-    processar_arquivo()
+    main()
