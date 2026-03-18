@@ -47,38 +47,41 @@ DATA_PROCESSAMENTO = obter_competencia()
 # --- CONFIGURAÇÃO INTELIGENTE DO ORACLE CLIENT ---
 def configurar_oracle():
     """
-    Tenta carregar o Oracle Client.
-    1. Se for .exe (frozen), busca na pasta 'oracle_client' ao lado.
-    2. Se for script, busca no caminho padrão de desenvolvimento.
-    Se não achar nada, deixa passar para o Modo Thin nativo.
+    Configura o uso EXCLUSIVO do Oracle Client Thick a partir da pasta local.
+    Se a pasta não existir ou o carregamento falhar, o script é interrompido.
     """
     try:
-        # Descobre onde o script ou o .exe está rodando
+        # Detecta o diretório base (seja .py ou .exe)
         if getattr(sys, 'frozen', False):
-            # Se for executável (.exe)
-            application_path = os.path.dirname(sys.executable)
+            base_dir = os.path.dirname(sys.executable)
         else:
-            # Se for script Python (.py)
-            application_path = os.path.dirname(os.path.abspath(__file__))
+            base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Caminho da pasta portátil
-        caminho_portatil = os.path.join(application_path, "oracle_client")
+        # Caminho absoluto para a pasta 'oracle_client'
+        caminho_cliente = os.path.abspath(os.path.join(base_dir, "oracle_client"))
 
-        # Verifica se a pasta portátil existe
-        if os.path.exists(caminho_portatil):
-            oracledb.init_oracle_client(lib_dir=caminho_portatil)
-            print(f"{Fore.GREEN}Oracle Client Thick carregado com sucesso!{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.CYAN}Pasta oracle_client não encontrada. Usando modo Thin nativo.{Style.RESET_ALL}")
-            
+        # Verifica obrigatoriedade da pasta
+        if not os.path.exists(caminho_cliente):
+            print(f"{Fore.RED}ERRO CRÍTICO: Pasta 'oracle_client' não encontrada em: {caminho_cliente}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Certifique-se de que a pasta está no mesmo local que o script/executável.{Style.RESET_ALL}")
+            input("Pressione ENTER para sair...")
+            sys.exit(1)
+
+        # Adiciona o caminho ao PATH do sistema operacional (importante para DLLs no Windows)
+        os.environ["PATH"] = caminho_cliente + os.pathsep + os.environ.get("PATH", "")
+
+        # Inicializa o cliente Thick apontando explicitamente para a pasta
+        oracledb.init_oracle_client(lib_dir=caminho_cliente)
+        
+        print(f"{Fore.GREEN}Oracle Client (Modo Thick) carregado com sucesso de:{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  -> {caminho_cliente}{Style.RESET_ALL}")
+
     except Exception as e:
-        # AGORA ELE VAI GRITAR O ERRO AO INVÉS DE ESCONDER
-        print(f"{Fore.RED}ERRO FATAL AO CARREGAR O ORACLE 19c: {e}{Style.RESET_ALL}")
-                    
-    except Exception as e:
-        # Se der erro aqui, vai estourar na conexão depois, então seguimos
-        pass
+        print(f"{Fore.RED}ERRO FATAL AO INICIALIZAR ORACLE CLIENT: {e}{Style.RESET_ALL}")
+        input("Pressione ENTER para sair...")
+        sys.exit(1)
 
+# Chama a configuração logo no início
 configurar_oracle()
 
 # Credenciais do banco de dados
@@ -97,36 +100,52 @@ RUBRICAS_EXCLUIDAS = [
 ]
 
 def formatar_matricula(matricula, emp_codigo):
-    """Formata a matrícula conforme as regras especificadas."""
+    """Formata a matrícula conforme as regras da empresa e trata excesso de zeros."""
     try:
         emp_codigo = int(emp_codigo)
     except:
         return str(matricula)
     
+    mat_str = str(matricula).strip()
+    
+    # Empresas 1 e 10 não seguem o padrão de máscara de pontos
     if (emp_codigo == 1 or emp_codigo == 10):
-        return str(matricula).strip()
+        return mat_str
     
-    mat_limpa = re.sub(r'[^0-9]', '', str(matricula))
+    # Remove qualquer caractere não numérico
+    mat_limpa = re.sub(r'[^0-9]', '', mat_str)
     
-    if (emp_codigo == 13 or emp_codigo == 15 or emp_codigo == 16 or emp_codigo == 20) and not mat_limpa.startswith('1'):
+    # Trata matrículas com zeros à esquerda (ex: de sistemas externos)
+    # Se após limpar tiver mais de 8 dígitos, remove os zeros iniciais
+    if len(mat_limpa) > 8:
+        mat_limpa = mat_limpa.lstrip('0')
+    
+    # Se a matrícula estiver vazia após o strip, retorna original para evitar erro
+    if not mat_limpa: return mat_str
+
+    # Aplica prefixos específicos por grupo de empresa
+    if (emp_codigo in [13, 15, 16, 20]) and not mat_limpa.startswith('1'):
         mat_limpa = '1' + mat_limpa
-    elif (emp_codigo == 14 or emp_codigo == 18 or emp_codigo == 21) and not mat_limpa.startswith('2'):
+    elif (emp_codigo in [14, 18, 21]) and not mat_limpa.startswith('2'):
         mat_limpa = '2' + mat_limpa
     elif emp_codigo == 17 and not mat_limpa.startswith('3'):
         mat_limpa = '3' + mat_limpa
-    elif (emp_codigo == 19 or emp_codigo == 23) and not mat_limpa.startswith('4'):
+    elif (emp_codigo in [19, 23]) and not mat_limpa.startswith('4'):
         mat_limpa = '4' + mat_limpa
 
+    # Aplica a máscara X.XXX.XXX-X
     if len(mat_limpa) >= 8:
         return f"{mat_limpa[0]}.{mat_limpa[1:4]}.{mat_limpa[4:7]}-{mat_limpa[7]}"
     else:
+        # Preenche com zeros à direita se for menor que 8 (raro)
         mat_limpa = mat_limpa.ljust(8, '0')
         return f"{mat_limpa[0]}.{mat_limpa[1:4]}.{mat_limpa[4:7]}-{mat_limpa[7]}"
 
 def corrigir_matriculas_por_cpf(df, emp_codigo):
     """
-    Verifica se a matrícula existe no Oracle. Se não existir ou for inválida,
-    tenta encontrar a correta baseada no CPF.
+    Verifica se a matrícula do arquivo pertence ao CPF. 
+    Se o par for válido, mantém (mesmo desligado). 
+    Caso contrário, busca a matrícula ativa do CPF.
     """
     print(f"  > Verificando/Corrigindo matrículas no banco de dados...")
     
@@ -145,44 +164,54 @@ def corrigir_matriculas_por_cpf(df, emp_codigo):
                         matricula_original = str(row['matricula']).strip()
                         cpf_atual = row['cpf_limpo']
                         
-                        # 1. Simula como a matrícula ficaria formatada
+                        # Formata a matrícula para o padrão do banco (X.XXX.XXX-X)
                         matricula_formatada = formatar_matricula(matricula_original, emp_codigo)
                         
-                        # 2. Verifica se a matrícula formatada REALMENTE EXISTE na empresa
-                        query_check = """
+                        # QUERY 1: Valida se o CPF é dono dessa matrícula na empresa (Ativo ou não)
+                        # Usando apelidos longos para evitar conflitos de nomes no Oracle
+                        query_valida = """
                             SELECT COUNT(*) 
-                            FROM ERGON.VINCULOS 
-                            WHERE MATRIC = :mat 
-                            AND EMP_CODIGO = :emp_codigo
+                            FROM ERGON.VINCULOS VINC_VAL
+                            JOIN ERGON.FUNCIONARIOS FUNC_VAL ON VINC_VAL.NUMFUNC = FUNC_VAL.NUMERO
+                            WHERE (VINC_VAL.MATRIC = :mat_form OR VINC_VAL.MATRIC = :mat_orig)
+                            AND VINC_VAL.EMP_CODIGO = :emp_codigo
+                            AND FUNC_VAL.CPF = :cpf
                         """
-                        cursor.execute(query_check, mat=matricula_formatada, emp_codigo=emp_codigo)
-                        existe_no_banco = cursor.fetchone()[0]
+                        cursor.execute(query_valida, 
+                                       mat_form=matricula_formatada, 
+                                       mat_orig=matricula_original,
+                                       emp_codigo=emp_codigo, 
+                                       cpf=cpf_atual)
                         
-                        # 3. Se a matrícula NÃO existe no banco, ou se veio vazia/zerada do arquivo, usamos o CPF
-                        if existe_no_banco == 0 or not matricula_original.isnumeric() or matricula_original == '0':
-                            
-                            query_cpf = """
-                                SELECT MATRIC FROM (
-                                    SELECT V.MATRIC 
-                                    FROM ERGON.FUNCIONARIOS F
-                                    JOIN ERGON.VINCULOS V ON V.NUMFUNC = F.NUMERO
-                                    WHERE F.CPF = :cpf
-                                    AND V.EMP_CODIGO = :emp_codigo
-                                    ORDER BY V.DTVAC NULLS FIRST
-                                ) WHERE ROWNUM = 1
-                            """
-                            cursor.execute(query_cpf, cpf=cpf_atual, emp_codigo=emp_codigo)
-                            resultado = cursor.fetchone()
-                            
-                            if resultado:
-                                matricula_corrigida = resultado[0]
-                                df.at[idx, 'matricula'] = matricula_corrigida
-                                print(f"{Fore.YELLOW}      - CPF {cpf_atual}: Matrícula alterada de '{matricula_original}' (Inexistente) para '{matricula_corrigida}'{Style.RESET_ALL}")
-                            else:
-                                print(f"{Fore.RED}      - CPF {cpf_atual}: Matrícula não existe e CPF não foi localizado.{Style.RESET_ALL}")
+                        if cursor.fetchone()[0] > 0:
+                            # Se o par CPF+Matrícula existe, mantemos a escolha do arquivo
+                            continue
+                        
+                        # QUERY 2: Se a matrícula não pertence ao CPF, busca a matrícula 
+                        # mais recente (DTVAC NULLS FIRST prioriza as ativas)
+                        # Corrigido: Removido DTADMISS que causava erro de identificador
+                        query_busca = """
+                            SELECT MATRIC FROM (
+                                SELECT VINC_BUSCA.MATRIC 
+                                FROM ERGON.FUNCIONARIOS FUNC_BUSCA
+                                JOIN ERGON.VINCULOS VINC_BUSCA ON VINC_BUSCA.NUMFUNC = FUNC_BUSCA.NUMERO
+                                WHERE FUNC_BUSCA.CPF = :cpf
+                                AND VINC_BUSCA.EMP_CODIGO = :emp_codigo
+                                ORDER BY VINC_BUSCA.DTVAC NULLS FIRST
+                            ) WHERE ROWNUM = 1
+                        """
+                        cursor.execute(query_busca, cpf=cpf_atual, emp_codigo=emp_codigo)
+                        res = cursor.fetchone()
+                        
+                        if res:
+                            mat_correta = res[0]
+                            df.at[idx, 'matricula'] = mat_correta
+                            print(f"{Fore.YELLOW}      - CPF {cpf_atual}: Matrícula '{matricula_original}' corrigida para '{mat_correta}'{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}      - CPF {cpf_atual}: Matrícula '{matricula_original}' não localizada na Empresa {emp_codigo}.{Style.RESET_ALL}")
                                 
         except Exception as e:
-             print(f"{Fore.RED}    Erro ao tentar corrigir matrículas por CPF: {e}{Style.RESET_ALL}")
+             print(f"{Fore.RED}    Erro Crítico na Correção por CPF: {e}{Style.RESET_ALL}")
              
     return df
 
@@ -353,13 +382,17 @@ def calcular_status_desconto(df):
 
 def arquivar_outputs_antigos(caminho_pasta, emp_codigo, pasta_antigos):
     """
-    Procura por Relatórios Finais e Arquivos de Carga antigos na pasta e move para 'antigos'.
+    Procura por Relatórios Finais, Arquivos de Carga, Logs e Rejeitos 
+    antigos na pasta e move para 'antigos'.
     """
-    print(f"  > Verificando arquivos de saída antigos (Relatórios/Cargas)...")
+    print(f"  > Verificando arquivos de saída antigos (Relatórios/Cargas/Logs/Rejeitos)...")
     
+    # Adicionamos .rej e .log à lista de busca
     padroes = [
         f"RELATORIO_FINAL_EMP_{emp_codigo}_*.xlsx",
-        f"CARGA_ERGON_EMP_{emp_codigo}_*.txt"
+        f"CARGA_ERGON_EMP_{emp_codigo}_*.txt",
+        f"CARGA_ERGON_EMP_{emp_codigo}_*.rej",
+        f"CARGA_ERGON_EMP_{emp_codigo}_*.log"
     ]
     
     movidos = 0
@@ -379,7 +412,7 @@ def arquivar_outputs_antigos(caminho_pasta, emp_codigo, pasta_antigos):
                 print(f"{Fore.RED}    Erro ao arquivar antigo {os.path.basename(arquivo)}: {e}{Style.RESET_ALL}")
     
     if movidos > 0:
-        print(f"    -> {movidos} arquivos de saída antigos movidos para pasta 'antigos'.")
+        print(f"    -> {movidos} arquivos (incluindo .rej/.log) movidos para pasta 'antigos'.")
 
 def processar_uma_empresa(emp_codigo, caminho_pasta):
     """Processa todos os arquivos Excel e CSV encontrados na pasta da empresa."""
